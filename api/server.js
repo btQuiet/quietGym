@@ -1,14 +1,12 @@
-/* quietGym API — passkey (WebAuthn) auth + per-user state storage for quietGym
-   No framework, JSON-file storage, signed session cookies.               */
+/* quietGym API — single-owner password auth + state storage.
+   No framework, JSON-file storage, signed session cookies. */
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import {
-  generateRegistrationOptions, verifyRegistrationResponse,
-  generateAuthenticationOptions, verifyAuthenticationResponse
-} from '@simplewebauthn/server';
+import { fileURLToPath } from 'node:url';
 import webpush from 'web-push';
+import { MAX_PASSWORD_BYTES, validatePasswordRecord, verifyPassword } from './password.js';
 import {
   clientIp,
   createFixedWindowRateLimiter,
@@ -24,27 +22,19 @@ const PRODUCTION = process.env.NODE_ENV === 'production';
 const HOST = process.env.HOST || '127.0.0.1';
 const ALLOW_NON_LOOPBACK = /^(1|true|yes|on)$/i.test(process.env.ALLOW_NON_LOOPBACK || '');
 const PORT = envInteger('PORT', 3000);
-const DATA = process.env.DATA_DIR || '/data';
-const RP_ID = process.env.RP_ID || 'localhost';
+const API_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DATA = process.env.DATA_DIR || path.join(API_DIR, '..', 'data');
 const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
-const RP_NAME = process.env.RP_NAME || 'quietGym';
-// Admin dashboard (issue): admins are matched by uid; INVITE_ONLY gates new signups behind a
-// code the admin generates. Both default off so a fresh self-hosted instance stays open.
-const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const INVITE_ONLY = /^(1|true|yes|on)$/i.test(process.env.INVITE_ONLY || '');
 // 90 days keeps someone who trains a few times a week permanently signed in without a stolen
-// cookie staying good for a year. Overridable because a family instance and one on the open
-// internet don't want the same number. Only affects cookies minted from now on — the expiry is
-// baked into each cookie when it's issued, so lowering this never cuts an existing session short.
+// cookie staying good for a year. Only affects cookies minted from now on — the expiry is baked
+// into each cookie when it is issued, so lowering this never cuts an existing session short.
 const SESSION_DAYS = envInteger('SESSION_DAYS', 90);
 const MAX_BODY = 5 * 1024 * 1024;
 // Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
-const USER_VERIFICATION = process.env.WEBAUTHN_USER_VERIFICATION || (PRODUCTION ? 'required' : 'preferred');
-const REQUIRE_USER_VERIFICATION = USER_VERIFICATION === 'required';
-const AUTH_RATE_LIMIT_MAX = envInteger('AUTH_RATE_LIMIT_MAX', 30);
-const AUTH_RATE_LIMIT_WINDOW_SECONDS = envInteger('AUTH_RATE_LIMIT_WINDOW_SECONDS', 300);
+const AUTH_RATE_LIMIT_MAX = envInteger('AUTH_RATE_LIMIT_MAX', 5);
+const AUTH_RATE_LIMIT_WINDOW_SECONDS = envInteger('AUTH_RATE_LIMIT_WINDOW_SECONDS', 900);
 
 validateRuntimeConfig({
   production: PRODUCTION,
@@ -53,9 +43,7 @@ validateRuntimeConfig({
   port: PORT,
   dataDir: DATA,
   origin: ORIGIN,
-  rpId: RP_ID,
   vapidSubject: VAPID_SUBJECT,
-  userVerification: USER_VERIFICATION,
   sessionDays: SESSION_DAYS,
   authRateLimitMax: AUTH_RATE_LIMIT_MAX,
   authRateLimitWindowSeconds: AUTH_RATE_LIMIT_WINDOW_SECONDS
@@ -71,19 +59,20 @@ if (PRODUCTION && Buffer.byteLength(SECRET, 'utf8') < 32)
   throw new Error('Session secret must contain at least 32 bytes in production');
 
 const dbFile = path.join(DATA, 'db.json');
-let db = { users: [], creds: [], subs: [], invites: [] };
+let db;
 if (fs.existsSync(dbFile)) {
   try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); }
   catch (error) { throw new Error(`Cannot read database ${dbFile}: ${error.message}`); }
 }
-if (db) {
-  db.subs ??= [];
-  db.invites ??= [];
-}
-if (!db || !Array.isArray(db.users) || !Array.isArray(db.creds) ||
-    !Array.isArray(db.subs) || !Array.isArray(db.invites))
+if (!db)
+  throw new Error(`Owner is not configured in ${dbFile}; run npm run password:set`);
+if (!Array.isArray(db.users) || !Array.isArray(db.subs))
   throw new Error(`Database ${dbFile} has an invalid structure`);
-const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
+if (db.users.length !== 1)
+  throw new Error(`Database ${dbFile} must contain exactly one owner; run npm run password:set`);
+try { validatePasswordRecord(db.users[0].password); }
+catch (error) { throw new Error(`Owner password is not configured correctly: ${error.message}`); }
+const publicUser = user => ({ id: user.id });
 function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
 function atomicWrite(file, content) {
   const tmp = file + '.tmp';
@@ -234,39 +223,16 @@ function readSession(req) {
   if (!uid || +exp < Date.now()) return null;
   const user = db.users.find(u => u.id === uid) || null;
   if (!user) return null;
-  if (user.disabled) return null;           // disabled accounts are locked out everywhere
   // Missing third field = pre-versioning cookie = version 0. Anything non-numeric is a malformed
   // payload (it still had to pass the HMAC, so this is belt-and-braces) and is refused outright.
   const claimed = ver === undefined ? 0 : Number(ver);
   if (!Number.isInteger(claimed) || claimed !== sessionVersion(user)) return null;
   return user;
 }
-// Guard for /api/admin/* — resolves the caller and 401/403s if they aren't an admin.
-function requireAdmin(req, res) {
-  const user = readSession(req);
-  if (!user) { json(res, 401, { error: 'not signed in' }); return null; }
-  if (!isAdmin(user)) { json(res, 403, { error: 'forbidden' }); return null; }
-  return user;
-}
 function sessionCookie(user) {
   return `gymsid=${makeSession(user)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
 }
 const clearCookie = `gymsid=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=Lax`;
-
-/* ---------- challenge store (in-memory, 5 min TTL) ---------- */
-const challenges = new Map(); // cid -> {challenge, name?, uid?, exp}
-function putChallenge(data) {
-  const cid = crypto.randomBytes(16).toString('base64url');
-  challenges.set(cid, { ...data, exp: Date.now() + 5 * 60000 });
-  return cid;
-}
-function takeChallenge(cid) {
-  const c = challenges.get(cid);
-  challenges.delete(cid);
-  if (!c || c.exp < Date.now()) return null;
-  return c;
-}
-setInterval(() => { for (const [k, v] of challenges) if (v.exp < Date.now()) challenges.delete(k); }, 60000).unref();
 
 /* ---------- helpers ---------- */
 function json(res, code, obj, extraHeaders) {
@@ -295,27 +261,10 @@ function readBody(req) {
     req.on('error', reject);
   });
 }
-const b64uToBuf = s => Buffer.from(s, 'base64url');
-
-/* ---------- live presence (in-memory) ---------- */
-// Clients heartbeat /api/activity while a workout is on screen; the admin dashboard reads who's
-// live. Purely ephemeral — never persisted. Expires shortly after the last ping.
-const presence = new Map();               // uid -> { name, exIdx, exTotal, setsDone, setsTotal, startedAt, updatedAt }
-const PRESENCE_TTL = 70000;               // ~3.5× the 20s client heartbeat
-function livePresence(uid) {
-  const p = presence.get(uid);
-  if (!p) return null;
-  if (Date.now() - p.updatedAt > PRESENCE_TTL) { presence.delete(uid); return null; }
-  return p;
-}
-setInterval(() => { for (const [k, v] of presence) if (Date.now() - v.updatedAt > PRESENCE_TTL) presence.delete(k); }, 30000).unref();
 
 /* ---------- abuse protection ---------- */
 const AUTH_ROUTES = new Set([
-  'POST /api/register/options',
-  'POST /api/register/verify',
-  'POST /api/login/options',
-  'POST /api/login/verify'
+  'POST /api/login'
 ]);
 const authRateLimiter = createFixedWindowRateLimiter({
   limit: AUTH_RATE_LIMIT_MAX,
@@ -343,121 +292,25 @@ function consumeAuthRateLimit(req, res) {
 const routes = {
   'GET /api/health': async (req, res) => json(res, 200, { ok: true }),
 
-  // Public config the login screen needs before anyone is signed in.
-  'GET /api/config': async (req, res) => json(res, 200, { invite_only: INVITE_ONLY }),
-
   'GET /api/me': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } });
+    json(res, 200, { user: publicUser(user) });
   },
 
-  'POST /api/register/options': async (req, res) => {
+  'POST /api/login': async (req, res) => {
     const body = await readBody(req);
-    const name = String(body.name || '').trim().slice(0, 40);
-    if (!name) return json(res, 400, { error: 'name required' });
-    const code = String(body.code || '').trim().toUpperCase();
-    if (INVITE_ONLY && !db.invites.some(i => i.code === code && !i.usedBy && !i.revoked))
-      return json(res, 403, { error: 'a valid invite code is required' });
-    const uid = crypto.randomBytes(12).toString('base64url');
-    const options = await generateRegistrationOptions({
-      rpName: RP_NAME, rpID: RP_ID,
-      userID: Buffer.from(uid), userName: name, userDisplayName: name,
-      attestationType: 'none',
-      authenticatorSelection: { residentKey: 'required', userVerification: USER_VERIFICATION },
-      excludeCredentials: []
-    });
-    const cid = putChallenge({ challenge: options.challenge, name, uid, code });
-    json(res, 200, { cid, options });
-  },
-
-  'POST /api/register/verify': async (req, res) => {
-    const body = await readBody(req);
-    const c = takeChallenge(body.cid);
-    if (!c || !c.uid) return json(res, 400, { error: 'challenge expired — try again' });
-    let verification;
-    try {
-      verification = await verifyRegistrationResponse({
-        response: body.credential,
-        expectedChallenge: c.challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
-        requireUserVerification: REQUIRE_USER_VERIFICATION
-      });
-    } catch (e) {
-      console.warn('registration verification failed', e.message);
-      return json(res, 400, { error: 'verification failed' });
-    }
-    if (!verification.verified) return json(res, 400, { error: 'not verified' });
-    const { credential } = verification.registrationInfo;
-    if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
-    // Re-check the invite at the last moment (it may have been used/revoked since options), then burn it.
-    let invite = null;
-    if (INVITE_ONLY) {
-      invite = db.invites.find(i => i.code === c.code && !i.usedBy && !i.revoked);
-      if (!invite) return json(res, 403, { error: 'invite code is no longer valid — ask for a new one' });
-    }
-    const user = { id: c.uid, name: c.name, created: new Date().toISOString() };
-    if (invite) { user.invitedBy = invite.code; invite.usedBy = user.id; invite.usedAt = user.created; }
-    db.users.push(user);
-    db.creds.push({
-      id: credential.id, userId: user.id,
-      publicKey: Buffer.from(credential.publicKey).toString('base64url'),
-      counter: credential.counter || 0,
-      transports: body.credential?.response?.transports || []
-    });
-    saveDb();
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
-  },
-
-  'POST /api/login/options': async (req, res) => {
-    const options = await generateAuthenticationOptions({
-      rpID: RP_ID, userVerification: USER_VERIFICATION, allowCredentials: []
-    });
-    const cid = putChallenge({ challenge: options.challenge });
-    json(res, 200, { cid, options });
-  },
-
-  'POST /api/login/verify': async (req, res) => {
-    const body = await readBody(req);
-    const c = takeChallenge(body.cid);
-    if (!c) return json(res, 400, { error: 'challenge expired — try again' });
-    const cred = db.creds.find(x => x.id === body.credential?.id);
-    if (!cred) return json(res, 404, { error: 'unknown passkey — create a profile first' });
-    let verification;
-    try {
-      verification = await verifyAuthenticationResponse({
-        response: body.credential,
-        expectedChallenge: c.challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
-        requireUserVerification: REQUIRE_USER_VERIFICATION,
-        credential: {
-          id: cred.id,
-          publicKey: b64uToBuf(cred.publicKey),
-          counter: cred.counter,
-          transports: cred.transports
-        }
-      });
-    } catch (e) {
-      console.warn('authentication verification failed', e.message);
-      return json(res, 400, { error: 'verification failed' });
-    }
-    if (!verification.verified) return json(res, 400, { error: 'not verified' });
-    cred.counter = verification.authenticationInfo.newCounter;
-    saveDb();
-    const user = db.users.find(u => u.id === cred.userId);
-    if (!user) return json(res, 500, { error: 'user missing' });
-    if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+    if (typeof body.password !== 'string' || Buffer.byteLength(body.password, 'utf8') > MAX_PASSWORD_BYTES)
+      return json(res, 400, { error: 'invalid password input' });
+    const user = db.users[0];
+    const valid = await verifyPassword(body.password, user.password);
+    if (!valid) return json(res, 401, { error: 'invalid password' });
+    json(res, 200, { user: publicUser(user) }, { 'Set-Cookie': sessionCookie(user) });
   },
 
   'POST /api/logout': async (req, res) => json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie }),
 
-  // "Sign out everywhere" — bumps this user's session version, which invalidates every cookie
-  // ever issued for the account, on every device, including a copy someone else walked off with.
-  // The caller's own cookie is cleared here too, so the browser doing it doesn't sit on a token
-  // it no longer accepts. Passkeys are untouched: signing back in works immediately.
+  // "Sign out everywhere" bumps the session version, invalidating every cookie issued before it.
   'POST /api/logout/all': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
@@ -527,108 +380,6 @@ const routes = {
     if (!user) return json(res, 401, { error: 'not signed in' });
     cancelRestTimer(user.id);
     json(res, 200, { ok: true });
-  },
-
-  // Live-workout heartbeat: client pings while a workout is on screen; { active:false } drops it.
-  'POST /api/activity': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    const body = await readBody(req);
-    if (body.active) {
-      presence.set(user.id, {
-        name: String(body.name || '').slice(0, 60),
-        exIdx: +body.exIdx || 0, exTotal: +body.exTotal || 0,
-        setsDone: +body.setsDone || 0, setsTotal: +body.setsTotal || 0,
-        startedAt: +body.startedAt || Date.now(),
-        updatedAt: Date.now()
-      });
-    } else presence.delete(user.id);
-    json(res, 200, { ok: true });
-  },
-
-  /* ---------- admin dashboard ---------- */
-  // One row per user, cheap enough for a personal instance (reads each state file once).
-  'GET /api/admin/users': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const users = db.users.map(u => {
-      const S = readState(u.id) || {};
-      const workouts = S.workouts || [];
-      const last = workouts[workouts.length - 1];
-      return {
-        id: u.id, name: u.name, created: u.created || null,
-        disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null,
-        workouts: workouts.length,
-        lastWorkout: last ? last.d : null,
-        lastSync: S._ts || null,
-        hasPush: db.subs.some(s => s.userId === u.id),
-        live: livePresence(u.id)
-      };
-    });
-    json(res, 200, { users, invite_only: INVITE_ONLY, now: Date.now() });
-  },
-
-  // Drill-down: full workout history + body-weight log for one user.
-  'GET /api/admin/user': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const id = new URL(req.url, 'http://x').searchParams.get('id');
-    const u = db.users.find(x => x.id === id);
-    if (!u) return json(res, 404, { error: 'no such user' });
-    const S = readState(u.id) || {};
-    json(res, 200, {
-      user: { id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null },
-      unit: S.unit || 'kg',
-      lastSync: S._ts || null,
-      routines: (S.routines || []).map(r => ({ id: r.id, name: r.name, emoji: r.emoji, count: (r.ex || []).length })),
-      bodyweight: S.bodyweight || [],
-      workouts: (S.workouts || []).slice().reverse()   // newest first for display
-    });
-  },
-
-  'POST /api/admin/user/disable': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const body = await readBody(req);
-    const u = db.users.find(x => x.id === body.id);
-    if (!u) return json(res, 404, { error: 'no such user' });
-    if (isAdmin(u)) return json(res, 400, { error: 'cannot disable an admin' });
-    u.disabled = !!body.disabled;
-    if (u.disabled) presence.delete(u.id);   // drop them off "training now" at once
-    saveDb();
-    json(res, 200, { ok: true, id: u.id, disabled: u.disabled });
-  },
-
-  'GET /api/admin/invites': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    // resolve usedBy uid → name for display
-    const invites = db.invites.map(i => ({
-      ...i, usedByName: i.usedBy ? (db.users.find(u => u.id === i.usedBy) || {}).name || null : null
-    }));
-    json(res, 200, { invites, invite_only: INVITE_ONLY });
-  },
-
-  'POST /api/admin/invites/new': async (req, res) => {
-    const admin = requireAdmin(req, res); if (!admin) return;
-    const body = await readBody(req);
-    let code;
-    // 16 hex chars = 64 bits, up from 8 chars / 32 bits. Authentication requests are rate-limited,
-    // but /api/register/options still tells a caller whether a code is good, so the code itself
-    // also has to be the thing that isn't worth guessing. Codes already in
-    // db.json keep working — validation is an exact string compare, never a length or format check.
-    do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (db.invites.some(i => i.code === code));
-    const invite = { code, note: String(body.note || '').slice(0, 60), createdBy: admin.id, created: new Date().toISOString() };
-    db.invites.push(invite);
-    saveDb();
-    json(res, 200, { invite });
-  },
-
-  'POST /api/admin/invites/revoke': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const body = await readBody(req);
-    const inv = db.invites.find(i => i.code === String(body.code || '').toUpperCase());
-    if (!inv) return json(res, 404, { error: 'no such code' });
-    if (inv.usedBy) return json(res, 400, { error: 'already used — cannot revoke' });
-    db.invites = db.invites.filter(i => i.code !== inv.code);
-    saveDb();
-    json(res, 200, { ok: true });
   }
 };
 
@@ -653,5 +404,5 @@ server.maxHeadersCount = 100;
 server.listen(PORT, HOST, () => {
   const address = server.address();
   const boundPort = typeof address === 'object' && address ? address.port : PORT;
-  console.log(`gym-api on ${HOST}:${boundPort} (rpID=${RP_ID}, origin=${ORIGIN})`);
+  console.log(`quietgym-api on ${HOST}:${boundPort} (origin=${ORIGIN})`);
 });

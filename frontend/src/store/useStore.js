@@ -12,7 +12,7 @@ export const DEF = {
   bodyweight: [], routines: [], week: {}, dayPlan: {},
   exWeights: {}, workouts: [], active: null, customEx: [], gifSize: 'full',
   // effort: which per-set effort scale is logged — 'none' | 'rir' | 'rpe'. null, not 'none', so
-  // that a profile which never chose (loaded state is overlaid on DEF, on every path: local,
+  // that an account which never chose (loaded state is overlaid on DEF, on every path: local,
   // server pull, backup import) still falls back to the `showRir` boolean this replaced and
   // keeps the column it had. See effortOf.
   reminder: { on: false, time: '08:00', tz: null }, effort: null
@@ -126,8 +126,8 @@ export const useStore = create((set, get) => {
       clearLocalSession()
     },
 
-    // "Sign out everywhere": the server bumps this profile's session version, which kills every
-    // session it has on any device — this browser included, so the app has to end up exactly
+    // "Sign out everywhere": the server bumps the owner's session version, which kills every
+    // session on every device — this browser included, so the app has to end up exactly
     // where a normal signOut leaves it. Unlike signOut the request is NOT swallowed: if it fails
     // the sessions elsewhere are all still valid, and wiping this device's copy of the data
     // would sign the user out of the one place the bump didn't reach. Caller reports the error.
@@ -183,7 +183,9 @@ export const useStore = create((set, get) => {
           get().update(s => { s.reminder = { ...s.reminder, tz } })
         }
       } catch (e) {
-        if (e.status === 401) get().setUser(null)
+        // Hosted mode is fail-closed: an old localStorage user must not unlock cached workout
+        // data when the cookie expired or the server cannot validate it.
+        get().setUser(null)
       }
       set({ ready: true })
     }

@@ -21,7 +21,7 @@ services:
         fi
     restart: "no"
 
-  # Passkey auth + per-user data (Node, no framework).
+  # Single-owner password auth + synced data (Node, no framework).
   # image: prebuilt (docker compose pull). build: from source (docker compose up --build).
   api:
     image: ghcr.io/duartesantos8/opengym-api:latest
@@ -34,10 +34,10 @@ services:
       - ALLOW_NON_LOOPBACK=1 # required only because the web container connects over the bridge
       - DATA_DIR=/data
     volumes:
-      - ./data:/data         # users, passkeys, per-user state, session secret — BACK THIS UP
+      - ./data:/data         # owner hash, state, push subscriptions and session secret
 
   # Builds the React frontend (multi-stage) and serves it, proxying /api → api
-  # and the exercise media from the shared volume. Single origin for passkeys.
+  # and the exercise media from the shared volume.
   web:
     image: ghcr.io/duartesantos8/opengym-web:latest
     build:

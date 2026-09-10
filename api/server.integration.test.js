@@ -6,8 +6,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { hashPassword } from './password.js';
 
 const API_DIR = path.dirname(fileURLToPath(import.meta.url));
+const OWNER_PASSWORD = 'integration test owner password';
+
+async function seedOwner(dataDir) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const password = await hashPassword(OWNER_PASSWORD);
+  fs.writeFileSync(path.join(dataDir, 'db.json'), JSON.stringify({
+    users: [{ id: 'owner', created: new Date(0).toISOString(), sv: 0, password }],
+    subs: []
+  }));
+}
 
 async function freePort() {
   return await new Promise((resolve, reject) => {
@@ -30,11 +41,7 @@ function startApi(dataDir, port, overrides = {}) {
       PORT: String(port),
       DATA_DIR: dataDir,
       ORIGIN: 'https://gym.example.test',
-      RP_ID: 'gym.example.test',
-      RP_NAME: 'quietGym test',
-      INVITE_ONLY: 'true',
       SESSION_DAYS: '30',
-      WEBAUTHN_USER_VERIFICATION: 'required',
       AUTH_RATE_LIMIT_MAX: '2',
       AUTH_RATE_LIMIT_WINDOW_SECONDS: '60',
       VAPID_SUBJECT: 'mailto:admin@example.test',
@@ -51,13 +58,13 @@ function startApi(dataDir, port, overrides = {}) {
   const ready = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error(`API did not start\nstdout: ${stdout}\nstderr: ${stderr}`)), 10000);
     const inspect = () => {
-      if (!stdout.includes('gym-api on ')) return;
+      if (!stdout.includes('quietgym-api on ')) return;
       clearTimeout(timeout);
       resolve();
     };
     child.stdout.on('data', inspect);
     child.once('exit', code => {
-      if (!stdout.includes('gym-api on ')) {
+      if (!stdout.includes('quietgym-api on ')) {
         clearTimeout(timeout);
         reject(new Error(`API exited with ${code}\nstdout: ${stdout}\nstderr: ${stderr}`));
       }
@@ -75,6 +82,7 @@ async function stopApi(child) {
 
 test('production HTTP protections work end to end', async t => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quietgym-api-'));
+  await seedOwner(dataDir);
   const port = await freePort();
   const api = startApi(dataDir, port);
   t.after(async () => {
@@ -92,26 +100,67 @@ test('production HTTP protections work end to end', async t => {
   assert.equal(health.headers.get('x-content-type-options'), 'nosniff');
   assert.deepEqual(await health.json(), { ok: true });
 
-  const missingOrigin = await fetch(`${base}/api/login/options`, { method: 'POST' });
+  const missingOrigin = await fetch(`${base}/api/login`, {
+    method: 'POST', body: JSON.stringify({ password: OWNER_PASSWORD })
+  });
   assert.equal(missingOrigin.status, 403);
 
-  const wrongOrigin = await fetch(`${base}/api/login/options`, {
+  const wrongOrigin = await fetch(`${base}/api/login`, {
     method: 'POST',
-    headers: { Origin: 'https://evil.example.test' }
+    headers: { Origin: 'https://evil.example.test', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: OWNER_PASSWORD })
   });
   assert.equal(wrongOrigin.status, 403);
 
-  const validRequest = () => fetch(`${base}/api/login/options`, {
+  const validRequest = password => fetch(`${base}/api/login`, {
     method: 'POST',
-    headers: { Origin: 'https://gym.example.test' }
+    headers: { Origin: 'https://gym.example.test', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password })
   });
-  const firstValid = await validRequest();
-  assert.equal(firstValid.status, 200);
-  assert.equal((await firstValid.json()).options.userVerification, 'required');
-  assert.equal((await validRequest()).status, 200);
-  const limited = await validRequest();
+  const invalid = await validRequest('incorrect password value');
+  assert.equal(invalid.status, 401);
+  assert.deepEqual(await invalid.json(), { error: 'invalid password' });
+
+  const valid = await validRequest(OWNER_PASSWORD);
+  assert.equal(valid.status, 200);
+  assert.deepEqual(await valid.json(), { user: { id: 'owner' } });
+  const cookie = valid.headers.get('set-cookie');
+  assert.match(cookie, /gymsid=/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /Secure/);
+  assert.match(cookie, /SameSite=Lax/);
+  assert.match(cookie, /Max-Age=2592000/);
+
+  const me = await fetch(`${base}/api/me`, { headers: { Cookie: cookie } });
+  assert.equal(me.status, 200);
+  assert.deepEqual(await me.json(), { user: { id: 'owner' } });
+
+  const limited = await validRequest(OWNER_PASSWORD);
   assert.equal(limited.status, 429);
   assert.equal(limited.headers.get('retry-after'), '60');
+});
+
+test('startup refuses to create an owner from a public request', async t => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quietgym-no-owner-'));
+  const port = await freePort();
+  const api = startApi(dataDir, port);
+  const startupResult = api.ready.catch(error => error);
+  t.after(async () => {
+    await stopApi(api.child);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const result = await new Promise(resolve => {
+    const timeout = setTimeout(() => resolve({ timedOut: true, code: null }), 10000);
+    api.child.once('exit', code => {
+      clearTimeout(timeout);
+      resolve({ timedOut: false, code });
+    });
+  });
+  assert.equal(result.timedOut, false);
+  assert.notEqual(result.code, 0);
+  assert.equal((await startupResult) instanceof Error, true);
+  assert.match(api.output().stderr, /Owner is not configured.*npm run password:set/);
 });
 
 test('a corrupt database stops startup instead of being replaced', async t => {

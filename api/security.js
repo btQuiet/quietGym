@@ -34,9 +34,7 @@ export function validateRuntimeConfig({
   port,
   dataDir,
   origin,
-  rpId,
   vapidSubject,
-  userVerification,
   sessionDays,
   authRateLimitMax,
   authRateLimitWindowSeconds
@@ -49,8 +47,6 @@ export function validateRuntimeConfig({
     errors.push('AUTH_RATE_LIMIT_MAX must be a positive integer');
   if (!Number.isInteger(authRateLimitWindowSeconds) || authRateLimitWindowSeconds < 1)
     errors.push('AUTH_RATE_LIMIT_WINDOW_SECONDS must be a positive integer');
-  if (!['preferred', 'required'].includes(userVerification))
-    errors.push('WEBAUTHN_USER_VERIFICATION must be "preferred" or "required"');
   if (!Number.isInteger(sessionDays) || sessionDays < 1 || sessionDays > 365)
     errors.push('SESSION_DAYS must be an integer between 1 and 365');
 
@@ -63,15 +59,6 @@ export function validateRuntimeConfig({
     errors.push('ORIGIN must be a valid URL origin');
   }
 
-  const normalizedRpId = String(rpId || '').toLowerCase();
-  if (!normalizedRpId || normalizedRpId.includes('://') || normalizedRpId.includes('/') || normalizedRpId.includes(':'))
-    errors.push('RP_ID must be a hostname without a scheme, port or path');
-  else if (parsedOrigin) {
-    const originHost = parsedOrigin.hostname.toLowerCase();
-    if (originHost !== normalizedRpId && !originHost.endsWith(`.${normalizedRpId}`))
-      errors.push('RP_ID must equal ORIGIN hostname or one of its parent domains');
-  }
-
   if (production) {
     if (!allowNonLoopback && !isLoopbackAddress(host))
       errors.push('HOST must be a loopback address in production (127.0.0.1 or ::1)');
@@ -79,9 +66,6 @@ export function validateRuntimeConfig({
       errors.push('DATA_DIR must be an absolute path in production');
     if (parsedOrigin?.protocol !== 'https:')
       errors.push('ORIGIN must use HTTPS in production');
-    if (userVerification !== 'required')
-      errors.push('WEBAUTHN_USER_VERIFICATION must be "required" in production');
-
     try {
       const subject = new URL(vapidSubject);
       if (!['https:', 'mailto:'].includes(subject.protocol))

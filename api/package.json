@@ -1,16 +1,19 @@
 {
-  "name": "gym-api",
+  "name": "quietgym-api",
   "version": "1.2.4",
   "private": true,
   "type": "module",
   "main": "server.js",
   "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=24.7.0"
+  },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "password:set": "node scripts/set-password.mjs"
   },
   "dependencies": {
-    "@simplewebauthn/server": "^13.1.1",
     "web-push": "^3.6.7"
   }
 }

@@ -15,30 +15,26 @@ const productionConfig = {
   port: 3000,
   dataDir: '/var/lib/quietgym',
   origin: 'https://gym.example.com',
-  rpId: 'gym.example.com',
   vapidSubject: 'mailto:admin@example.com',
-  userVerification: 'required',
   sessionDays: 90,
-  authRateLimitMax: 30,
-  authRateLimitWindowSeconds: 300
+  authRateLimitMax: 5,
+  authRateLimitWindowSeconds: 900
 };
 
 test('accepts a hardened production configuration', () => {
   assert.doesNotThrow(() => validateRuntimeConfig(productionConfig));
 });
 
-test('rejects public binding, HTTP and optional user verification in production', () => {
+test('rejects public binding and HTTP in production', () => {
   assert.throws(
     () => validateRuntimeConfig({
       ...productionConfig,
       host: '0.0.0.0',
-      origin: 'http://gym.example.com',
-      userVerification: 'preferred'
+      origin: 'http://gym.example.com'
     }),
     error => {
       assert.match(error.message, /loopback/);
       assert.match(error.message, /HTTPS/);
-      assert.match(error.message, /must be "required"/);
       return true;
     }
   );
@@ -50,13 +46,6 @@ test('allows an explicit non-loopback bind for an isolated container network', (
     host: '0.0.0.0',
     allowNonLoopback: true
   }));
-});
-
-test('rejects an RP ID unrelated to the public origin', () => {
-  assert.throws(
-    () => validateRuntimeConfig({ ...productionConfig, rpId: 'unrelated.example' }),
-    /RP_ID must equal ORIGIN hostname/
-  );
 });
 
 test('requires an exact Origin on unsafe production requests', () => {

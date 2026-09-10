@@ -1,7 +1,7 @@
 // Demo build (VITE_DEMO=1) — what runs on the GitHub Pages deployment.
 //
-// Pages can only serve static files, so there is no API: passkey sign-in, per-profile sync
-// and the admin dashboard all need the Node backend and are simply not part of a demo build.
+// Pages can only serve static files, so there is no API: password sign-in and cross-device
+// sync need the Node backend and are simply not part of a demo build.
 // The app therefore stays in guest mode (everything in localStorage) and boots with a seeded
 // example history (demoSeed.js), so the charts, heatmap, streaks and "last time you lifted…"
 // pre-fills have something to show instead of an empty shell.

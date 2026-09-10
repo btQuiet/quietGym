@@ -1,5 +1,21 @@
 // German UI strings. Keys are the English source strings (see lib/i18n.js).
 export default {
+  'Password': 'Password',
+  'Sign in': 'Sign in',
+  'Enter your password': 'Enter your password',
+  'Incorrect password': 'Incorrect password',
+  'This demo runs entirely in your browser on example data — nothing is sent anywhere. Password sign-in and sync across your devices come with the quietGym server, which you get by self-hosting it.': 'This demo runs entirely in your browser on example data — nothing is sent anywhere. Password sign-in and sync across your devices come with the quietGym server, which you get by self-hosting it.',
+  'Your workouts. Your weights. Your data.': 'Your workouts. Your weights. Your data.',
+  'Your server password protects access to your synced data.': 'Your server password protects access to your synced data.',
+  'Signs the account out on every device, including this one. Sign in with your password again anytime.': 'Signs the account out on every device, including this one. Sign in with your password again anytime.',
+  'Password sign-in, sync across your devices, your own data.': 'Password sign-in, sync across your devices, your own data.',
+  'Owner account': 'Owner account',
+  'Signed in — data syncs across your devices.': 'Signed in — data syncs across your devices.',
+  'Your data is synced to the server first, then cleared from this device.': 'Your data is synced to the server first, then cleared from this device.',
+  'Ends the account sessions on all your devices.': 'Ends the account sessions on all your devices.',
+  'Sign in required': 'Sign in required',
+  'synced with your account': 'synced with your account',
+  'Your data syncs with your account — sign in anywhere to see it.': 'Your data syncs with your account — sign in anywhere to see it.',
   // --- generic ---
   'Confirm': 'Bestätigen',
   'Cancel': 'Abbrechen',
