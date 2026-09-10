@@ -1,4 +1,4 @@
-/* opengym-api — passkey (WebAuthn) auth + per-user state storage for openGym
+/* quietGym API — passkey (WebAuthn) auth + per-user state storage for quietGym
    No framework, JSON-file storage, signed session cookies.               */
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -9,12 +9,25 @@ import {
   generateAuthenticationOptions, verifyAuthenticationResponse
 } from '@simplewebauthn/server';
 import webpush from 'web-push';
+import {
+  clientIp,
+  createFixedWindowRateLimiter,
+  requestOriginAllowed,
+  validateRuntimeConfig
+} from './security.js';
 
-const PORT = +(process.env.PORT || 3000);
+const envInteger = (name, fallback) => {
+  const value = process.env[name];
+  return value === undefined || value === '' ? fallback : Number(value);
+};
+const PRODUCTION = process.env.NODE_ENV === 'production';
+const HOST = process.env.HOST || '127.0.0.1';
+const ALLOW_NON_LOOPBACK = /^(1|true|yes|on)$/i.test(process.env.ALLOW_NON_LOOPBACK || '');
+const PORT = envInteger('PORT', 3000);
 const DATA = process.env.DATA_DIR || '/data';
 const RP_ID = process.env.RP_ID || 'localhost';
 const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
-const RP_NAME = process.env.RP_NAME || 'openGym';
+const RP_NAME = process.env.RP_NAME || 'quietGym';
 // Admin dashboard (issue): admins are matched by uid; INVITE_ONLY gates new signups behind a
 // code the admin generates. Both default off so a fresh self-hosted instance stays open.
 const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -23,10 +36,30 @@ const INVITE_ONLY = /^(1|true|yes|on)$/i.test(process.env.INVITE_ONLY || '');
 // cookie staying good for a year. Overridable because a family instance and one on the open
 // internet don't want the same number. Only affects cookies minted from now on — the expiry is
 // baked into each cookie when it's issued, so lowering this never cuts an existing session short.
-const SESSION_DAYS = Math.max(1, +(process.env.SESSION_DAYS || 90) || 90);
+const SESSION_DAYS = envInteger('SESSION_DAYS', 90);
 const MAX_BODY = 5 * 1024 * 1024;
 // Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
+const USER_VERIFICATION = process.env.WEBAUTHN_USER_VERIFICATION || (PRODUCTION ? 'required' : 'preferred');
+const REQUIRE_USER_VERIFICATION = USER_VERIFICATION === 'required';
+const AUTH_RATE_LIMIT_MAX = envInteger('AUTH_RATE_LIMIT_MAX', 30);
+const AUTH_RATE_LIMIT_WINDOW_SECONDS = envInteger('AUTH_RATE_LIMIT_WINDOW_SECONDS', 300);
+
+validateRuntimeConfig({
+  production: PRODUCTION,
+  host: HOST,
+  allowNonLoopback: ALLOW_NON_LOOPBACK,
+  port: PORT,
+  dataDir: DATA,
+  origin: ORIGIN,
+  rpId: RP_ID,
+  vapidSubject: VAPID_SUBJECT,
+  userVerification: USER_VERIFICATION,
+  sessionDays: SESSION_DAYS,
+  authRateLimitMax: AUTH_RATE_LIMIT_MAX,
+  authRateLimitWindowSeconds: AUTH_RATE_LIMIT_WINDOW_SECONDS
+});
 
 fs.mkdirSync(DATA, { recursive: true });
 
@@ -34,30 +67,50 @@ fs.mkdirSync(DATA, { recursive: true });
 const secretFile = path.join(DATA, 'secret');
 if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
 const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
+if (PRODUCTION && Buffer.byteLength(SECRET, 'utf8') < 32)
+  throw new Error('Session secret must contain at least 32 bytes in production');
 
 const dbFile = path.join(DATA, 'db.json');
 let db = { users: [], creds: [], subs: [], invites: [] };
-try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
-db.subs = db.subs || [];
-db.invites = db.invites || [];
+if (fs.existsSync(dbFile)) {
+  try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); }
+  catch (error) { throw new Error(`Cannot read database ${dbFile}: ${error.message}`); }
+}
+if (db) {
+  db.subs ??= [];
+  db.invites ??= [];
+}
+if (!db || !Array.isArray(db.users) || !Array.isArray(db.creds) ||
+    !Array.isArray(db.subs) || !Array.isArray(db.invites))
+  throw new Error(`Database ${dbFile} has an invalid structure`);
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
 function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
 function atomicWrite(file, content) {
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, content);
+  fs.writeFileSync(tmp, content, { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
 const stateFile = uid => path.join(DATA, 'state-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
 function readState(uid) {
-  try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
+  const file = stateFile(uid);
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw new Error(`Cannot read state ${file}: ${error.message}`);
+  }
 }
 
 /* ---------- push notifications (Web Push / VAPID) ---------- */
 const vapidFile = path.join(DATA, 'vapid.json');
 let vapid;
-try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
-catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
+if (fs.existsSync(vapidFile)) {
+  try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
+  catch (error) { throw new Error(`Cannot read VAPID keys ${vapidFile}: ${error.message}`); }
+} else {
+  vapid = webpush.generateVAPIDKeys();
+  fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 });
+}
+if (!vapid?.publicKey || !vapid?.privateKey) throw new Error(`VAPID key file ${vapidFile} has an invalid structure`);
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
 async function sendPush(userId, payload) {
@@ -218,7 +271,13 @@ setInterval(() => { for (const [k, v] of challenges) if (v.exp < Date.now()) cha
 /* ---------- helpers ---------- */
 function json(res, code, obj, extraHeaders) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...(extraHeaders || {}) });
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    ...(extraHeaders || {})
+  });
   res.end(body);
 }
 function readBody(req) {
@@ -251,9 +310,38 @@ function livePresence(uid) {
 }
 setInterval(() => { for (const [k, v] of presence) if (Date.now() - v.updatedAt > PRESENCE_TTL) presence.delete(k); }, 30000).unref();
 
+/* ---------- abuse protection ---------- */
+const AUTH_ROUTES = new Set([
+  'POST /api/register/options',
+  'POST /api/register/verify',
+  'POST /api/login/options',
+  'POST /api/login/verify'
+]);
+const authRateLimiter = createFixedWindowRateLimiter({
+  limit: AUTH_RATE_LIMIT_MAX,
+  windowMs: AUTH_RATE_LIMIT_WINDOW_SECONDS * 1000
+});
+setInterval(
+  () => authRateLimiter.cleanup(),
+  Math.min(Math.max(AUTH_RATE_LIMIT_WINDOW_SECONDS * 1000, 1000), 60000)
+).unref();
+
+function consumeAuthRateLimit(req, res) {
+  const ip = clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']);
+  const result = authRateLimiter.check(ip);
+  res.setHeader('RateLimit-Limit', String(result.limit));
+  res.setHeader('RateLimit-Remaining', String(result.remaining));
+  res.setHeader('RateLimit-Reset', String(Math.ceil(result.resetAt / 1000)));
+  if (result.allowed) return true;
+  json(res, 429, { error: 'too many authentication attempts — try again later' }, {
+    'Retry-After': String(result.retryAfter)
+  });
+  return false;
+}
+
 /* ---------- routes ---------- */
 const routes = {
-  'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: db.users.length }),
+  'GET /api/health': async (req, res) => json(res, 200, { ok: true }),
 
   // Public config the login screen needs before anyone is signed in.
   'GET /api/config': async (req, res) => json(res, 200, { invite_only: INVITE_ONLY }),
@@ -276,7 +364,7 @@ const routes = {
       rpName: RP_NAME, rpID: RP_ID,
       userID: Buffer.from(uid), userName: name, userDisplayName: name,
       attestationType: 'none',
-      authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
+      authenticatorSelection: { residentKey: 'required', userVerification: USER_VERIFICATION },
       excludeCredentials: []
     });
     const cid = putChallenge({ challenge: options.challenge, name, uid, code });
@@ -294,9 +382,12 @@ const routes = {
         expectedChallenge: c.challenge,
         expectedOrigin: ORIGIN,
         expectedRPID: RP_ID,
-        requireUserVerification: false
+        requireUserVerification: REQUIRE_USER_VERIFICATION
       });
-    } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
+    } catch (e) {
+      console.warn('registration verification failed', e.message);
+      return json(res, 400, { error: 'verification failed' });
+    }
     if (!verification.verified) return json(res, 400, { error: 'not verified' });
     const { credential } = verification.registrationInfo;
     if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
@@ -321,7 +412,7 @@ const routes = {
 
   'POST /api/login/options': async (req, res) => {
     const options = await generateAuthenticationOptions({
-      rpID: RP_ID, userVerification: 'preferred', allowCredentials: []
+      rpID: RP_ID, userVerification: USER_VERIFICATION, allowCredentials: []
     });
     const cid = putChallenge({ challenge: options.challenge });
     json(res, 200, { cid, options });
@@ -340,7 +431,7 @@ const routes = {
         expectedChallenge: c.challenge,
         expectedOrigin: ORIGIN,
         expectedRPID: RP_ID,
-        requireUserVerification: false,
+        requireUserVerification: REQUIRE_USER_VERIFICATION,
         credential: {
           id: cred.id,
           publicKey: b64uToBuf(cred.publicKey),
@@ -348,7 +439,10 @@ const routes = {
           transports: cred.transports
         }
       });
-    } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
+    } catch (e) {
+      console.warn('authentication verification failed', e.message);
+      return json(res, 400, { error: 'verification failed' });
+    }
     if (!verification.verified) return json(res, 400, { error: 'not verified' });
     cred.counter = verification.authenticationInfo.newCounter;
     saveDb();
@@ -375,10 +469,7 @@ const routes = {
   'GET /api/data': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    try {
-      const state = JSON.parse(fs.readFileSync(stateFile(user.id), 'utf8'));
-      json(res, 200, { state });
-    } catch { json(res, 200, { state: null }); }
+    json(res, 200, { state: readState(user.id) });
   },
 
   'PUT /api/data': async (req, res) => {
@@ -417,7 +508,7 @@ const routes = {
   'POST /api/push/test': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    await sendPush(user.id, { title: 'openGym', body: 'Test notification ✅ — this is what alerts look like.', tag: 'test' });
+    await sendPush(user.id, { title: 'quietGym', body: 'Test notification ✅ — this is what alerts look like.', tag: 'test' });
     json(res, 200, { ok: true });
   },
 
@@ -518,9 +609,9 @@ const routes = {
     const admin = requireAdmin(req, res); if (!admin) return;
     const body = await readBody(req);
     let code;
-    // 16 hex chars = 64 bits, up from 8 chars / 32 bits. The app has no rate limiting by design
-    // (that's the reverse proxy's job) and /api/register/options tells a caller whether a code is
-    // good, so the code itself has to be the thing that isn't worth guessing. Codes already in
+    // 16 hex chars = 64 bits, up from 8 chars / 32 bits. Authentication requests are rate-limited,
+    // but /api/register/options still tells a caller whether a code is good, so the code itself
+    // also has to be the thing that isn't worth guessing. Codes already in
     // db.json keep working — validation is an exact string compare, never a length or format check.
     do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (db.invites.some(i => i.code === code));
     const invite = { code, note: String(body.note || '').slice(0, 60), createdBy: admin.id, created: new Date().toISOString() };
@@ -541,14 +632,26 @@ const routes = {
   }
 };
 
-http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const key = req.method + ' ' + url.pathname;
   const handler = routes[key];
   if (!handler) return json(res, 404, { error: 'not found' });
+  if (!requestOriginAllowed(req.method, req.headers.origin, ORIGIN, PRODUCTION))
+    return json(res, 403, { error: 'invalid request origin' });
+  if (AUTH_ROUTES.has(key) && !consumeAuthRateLimit(req, res)) return;
   try { await handler(req, res); }
   catch (e) {
     console.error(key, e);
     if (!res.headersSent) json(res, 500, { error: 'server error' });
   }
-}).listen(PORT, () => console.log(`gym-api on :${PORT} (rpID=${RP_ID}, origin=${ORIGIN})`));
+});
+server.requestTimeout = 30000;
+server.headersTimeout = 10000;
+server.keepAliveTimeout = 5000;
+server.maxHeadersCount = 100;
+server.listen(PORT, HOST, () => {
+  const address = server.address();
+  const boundPort = typeof address === 'object' && address ? address.port : PORT;
+  console.log(`gym-api on ${HOST}:${boundPort} (rpID=${RP_ID}, origin=${ORIGIN})`);
+});

@@ -1,0 +1,55 @@
+# Private server documentation and local operations
+server/
+
+# Runtime configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Application data generated at runtime
+data/
+
+# Dependencies
+node_modules/
+.npm/
+.pnpm-store/
+
+# Build, test, and cache output
+dist/
+build/
+coverage/
+.vite/
+.cache/
+*.tsbuildinfo
+
+# Logs and temporary files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tmp
+*.temp
+
+# Mobile signing and machine-local configuration
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.mobileprovision
+keystore.properties
+local.properties
+
+# Editors
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# Operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini

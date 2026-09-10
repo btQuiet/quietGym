@@ -1,6 +1,6 @@
-/* openGym service worker — runtime caching (works with Vite's hashed asset names).
+/* quietGym service worker — runtime caching (works with Vite's hashed asset names).
    Media (img/gif) cache-first; everything else network-first with offline fallback. */
-const CACHE = 'opengym-rt-v1'
+const CACHE = 'quietgym-rt-v2'
 
 self.addEventListener('install', () => self.skipWaiting())
 self.addEventListener('activate', e => {
@@ -10,11 +10,11 @@ self.addEventListener('activate', e => {
 })
 self.addEventListener('push', e => {
   const data = e.data ? e.data.json() : {}
-  e.waitUntil(self.registration.showNotification(data.title || 'openGym', {
+  e.waitUntil(self.registration.showNotification(data.title || 'quietGym', {
     body: data.body || '',
-    icon: 'icon-512.png',
-    badge: 'icon-180.png',
-    tag: data.tag || 'opengym',
+    icon: 'quietgym-icon-512.png',
+    badge: 'quietgym-icon-180.png',
+    tag: data.tag || 'quietgym',
     renotify: true
   }))
 })

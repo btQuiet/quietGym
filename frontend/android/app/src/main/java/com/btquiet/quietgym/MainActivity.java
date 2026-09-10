@@ -1,4 +1,4 @@
-package ch.duartesantos.opengym;
+package com.btquiet.quietgym;
 
 import com.getcapacitor.BridgeActivity;
 

@@ -30,6 +30,8 @@ services:
     env_file: .env
     environment:
       - PORT=3000            # internal port (nginx proxies here) — do not change
+      - HOST=0.0.0.0         # container network only; native production stays on 127.0.0.1
+      - ALLOW_NON_LOOPBACK=1 # required only because the web container connects over the bridge
       - DATA_DIR=/data
     volumes:
       - ./data:/data         # users, passkeys, per-user state, session secret — BACK THIS UP
